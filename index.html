@@ -1016,18 +1016,39 @@ $("result").addEventListener("click",e=>{const b=e.target.closest("button");if(!
   if(b.id==="toHome"){sfx.tap();renderHome();show("home")}});
 
 /* ======================================================================
-   BATTLE — peer-to-peer через PeerJS. Хост держит игру, остальные подключаются по коду.
+   BATTLE — peer-to-peer через PeerJS. Хост держит игру и раз в 2 секунды
+   рассылает полное состояние, так что потерянное сообщение или обрыв связи
+   лечатся сами: участник догоняет текущий вопрос или переподключается.
    ====================================================================== */
 const PEER_PREFIX="pochtastolits-v1-";
 const MAX_PLAYERS=6; // ты + 5 друзей
 const CODE_ABC="ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 const newCode=()=>Array.from({length:5},()=>CODE_ABC[Math.random()*CODE_ABC.length|0]).join("");
 const battleLink=code=>baseURL()+"#battle="+code;
+const PEER_OPTS={debug:0,config:{iceServers:[
+  {urls:["stun:stun.l.google.com:19302","stun:stun1.l.google.com:19302","stun:stun.cloudflare.com:3478"]},
+  {urls:["turn:openrelay.metered.ca:80","turn:openrelay.metered.ca:443","turn:openrelay.metered.ca:443?transport=tcp"],username:"openrelayproject",credential:"openrelayproject"}
+]}};
+const CONN_OPTS={reliable:true,serialization:"json"};
 let H=null;   // состояние хоста
-let C=null;   // состояние участника (и у хоста тоже — для своего экрана)
+let C=null;   // состояние экрана игрока (у хоста тоже)
+let G=null;   // соединение участника
 
 function peerReady(){return typeof window.Peer==="function"}
 function avatar(p,i){const n=(p.name||"?").trim()[0]||"?";return `<span class="av" style="background:${COLORS[(p.color??i)%COLORS.length]}">${esc(n.toUpperCase())}</span>`}
+let lastToastAt=0;function toastOnce(t){if(Date.now()-lastToastAt>6000){lastToastAt=Date.now();toast(t)}}
+
+/* экран не гаснет во время батла */
+let wakeLock=null;
+async function keepAwake(on){try{
+  if(on){if(!wakeLock&&navigator.wakeLock&&document.visibilityState==="visible"){wakeLock=await navigator.wakeLock.request("screen");wakeLock.addEventListener("release",()=>{wakeLock=null})}}
+  else if(wakeLock){const w=wakeLock;wakeLock=null;await w.release()}
+}catch(e){}}
+document.addEventListener("visibilitychange",()=>{
+  if(document.visibilityState!=="visible")return;
+  if(H||G)keepAwake(true);
+  if(G&&G.ok)guestCheck(true);
+});
 
 /* ---- setup screen (host) ---- */
 function renderBSet(err){
@@ -1064,6 +1085,8 @@ $("bset").addEventListener("click",e=>{
   else if(grp==="bsReg"){S.bt.region=b.dataset.v;saveS();renderBSet()}
   else if(grp==="bsTime"){S.bt.time=+b.dataset.v;saveS();renderBSet()}
   else if(b.id==="bsGo")hostCreate();
+  else if(b.id==="jGo")guestJoin(b.dataset.code);
+  else if(b.id==="jBack"){guestLeave();renderHome();show("home")}
 });
 
 /* ---- host ---- */
@@ -1072,90 +1095,119 @@ function hostCreate(tries=0){
   if(!peerReady()){renderBSet("Не загрузился модуль для батла. Проверь интернет и обнови страницу.");return}
   const btn=$("bsGo");if(btn){btn.disabled=true;btn.textContent="Создаю комнату…"}
   const code=newCode();
-  const peer=new Peer(PEER_PREFIX+code,{debug:0});
+  const peer=new Peer(PEER_PREFIX+code,PEER_OPTS);
   let opened=false;
-  peer.on("open",()=>{opened=true;
-    H={peer,code,conns:new Map(),settings:Object.assign({},S.bt),phase:"lobby",players:[{id:"host",name:S.name,color:0,score:0,ok:0,left:false}],
-       q:[],qi:-1,answers:new Map(),timer:null,auto:null};
+  peer.on("open",()=>{
+    if(opened)return;opened=true;
+    H={peer,code,conns:new Map(),settings:Object.assign({},S.bt),phase:"lobby",
+       players:[{id:"host",name:S.name,color:0,score:0,ok:0,left:false,off:false}],
+       q:[],qi:-1,answers:new Map(),timer:null,auto:null,curQ:null,lastR:null,lastEnd:null,qStart:0};
+    H.beat=setInterval(hostBeat,2000);
     C={host:true,me:"host",players:[],settings:H.settings,code};
-    hostBroadcastLobby();show("blobby");
+    keepAwake(true);hostBroadcastLobby();show("blobby");
   });
   peer.on("connection",conn=>hostOnConn(conn));
   peer.on("error",err=>{
     if(!opened&&err.type==="unavailable-id"&&tries<3){peer.destroy();hostCreate(tries+1);return}
     if(!opened){peer.destroy();renderBSet("Не получилось создать комнату ("+(err.type||"ошибка сети")+"). Попробуй ещё раз.");return}
-    if(err.type==="network"||err.type==="server-error")toast("Связь с сервером пропала, но игроки в комнате остаются");
   });
-  peer.on("disconnected",()=>{try{peer.reconnect()}catch(e){}});
+  // связь с сервером знакомств нужна, чтобы друзья могли (пере)подключаться
+  peer.on("disconnected",()=>{if(H&&H.peer===peer&&!peer.destroyed)setTimeout(()=>{try{if(!peer.destroyed&&peer.disconnected)peer.reconnect()}catch(e){}},1000)});
 }
 function hostOnConn(conn){
   conn.on("data",raw=>hostOnData(conn,raw));
-  conn.on("close",()=>hostDrop(conn.peer));
-  conn.on("error",()=>hostDrop(conn.peer));
+  const drop=()=>hostDrop(conn);
+  conn.on("close",drop);conn.on("error",drop);
+  if(conn.peerConnection){try{conn.peerConnection.addEventListener("iceconnectionstatechange",()=>{const s=conn.peerConnection.iceConnectionState;if(s==="failed"||s==="closed")drop()})}catch(e){}}
 }
-function hostSend(conn,msg){try{if(conn.open)conn.send(msg)}catch(e){}}
-function hostBroadcast(msg){H.conns.forEach(c=>hostSend(c,msg));clientOn(msg)}
+function hostSend(conn,msg){try{if(conn&&conn.open)conn.send(msg)}catch(e){}}
+function hostBroadcast(msg){if(!H)return;H.conns.forEach(c=>hostSend(c,msg));clientOn(msg)}
+const activePlayers=()=>H.players.filter(p=>!p.left&&!p.off);
 function hostOnData(conn,m){
-  if(!m||typeof m!=="object")return;
+  if(!H||!m||typeof m!=="object")return;
   if(m.t==="join"){
+    const key=String(m.key||conn.peer).replace(/[^a-z0-9]/gi,"").slice(0,32)||conn.peer;
+    if(key==="host")return;
     const name=String(m.name||"").trim().slice(0,16)||"Игрок";
-    const existing=H.players.find(p=>p.id===conn.peer);
-    if(!existing){
-      if(H.phase!=="lobby"){hostSend(conn,{t:"deny",reason:"Батл уже идёт. Дождись следующего раунда."});setTimeout(()=>conn.close(),300);return}
-      if(H.players.filter(p=>!p.left).length>=MAX_PLAYERS){hostSend(conn,{t:"deny",reason:"В батле уже 6 игроков — мест нет."});setTimeout(()=>conn.close(),300);return}
-      const used=new Set(H.players.map(p=>p.color));let color=0;while(used.has(color))color++;
-      H.players.push({id:conn.peer,name,color,score:0,ok:0,left:false});
-    }else existing.name=name;
-    H.conns.set(conn.peer,conn);
-    hostSend(conn,{t:"hello",you:conn.peer,code:H.code});
-    sfx.join();hostBroadcastLobby();
-  }else if(m.t==="a"){hostAnswer(conn.peer,m)}
+    let p=H.players.find(x=>x.id===key);
+    if(!p){
+      if(H.phase!=="lobby"){hostSend(conn,{t:"deny",reason:"Батл уже идёт. Дождись следующего раунда."});setTimeout(()=>{try{conn.close()}catch(e){}},400);return}
+      if(H.players.filter(x=>!x.left).length>=MAX_PLAYERS){hostSend(conn,{t:"deny",reason:"В батле уже 6 игроков — мест нет."});setTimeout(()=>{try{conn.close()}catch(e){}},400);return}
+      const used=new Set(H.players.filter(x=>!x.left).map(x=>x.color));let color=0;while(used.has(color))color++;
+      p={id:key,name,color,score:0,ok:0,left:false,off:false};H.players.push(p);sfx.join();
+    }else{
+      const back=p.off||p.left;p.name=name;p.off=false;p.left=false;clearTimeout(p.offT);
+      if(back&&H.phase!=="lobby")toastOnce(`${name} снова в игре`);
+    }
+    conn._key=key;
+    const old=H.conns.get(key);H.conns.set(key,conn);
+    if(old&&old!==conn){try{old.close()}catch(e){}}
+    hostSend(conn,{t:"hello",you:key,code:H.code});
+    if(H.phase==="lobby")hostBroadcastLobby();else hostSend(conn,hostState());
+  }
+  else if(m.t==="a"){if(conn._key&&H.conns.get(conn._key)===conn)hostAnswer(conn._key,m)}
+  else if(m.t==="sync"){hostSend(conn,hostState())}
 }
-function hostDrop(id){
-  if(!H)return;H.conns.delete(id);
-  const p=H.players.find(p=>p.id===id);if(!p)return;
-  if(H.phase==="lobby")H.players=H.players.filter(x=>x.id!==id);else p.left=true;
-  if(H.phase==="lobby")hostBroadcastLobby();
-  else{hostBroadcast({t:"left",name:p.name});if(H.phase==="q")hostMaybeReveal()}
+function hostDrop(conn){
+  if(!H||!conn._key)return;const key=conn._key;
+  if(H.conns.get(key)!==conn)return; // игрок уже переподключился новым соединением
+  H.conns.delete(key);
+  const p=H.players.find(x=>x.id===key);if(!p)return;
+  if(H.phase==="lobby"){H.players=H.players.filter(x=>x.id!==key);hostBroadcastLobby();return}
+  p.off=true;
+  if(H.phase==="q")hostMaybeReveal();
+  clearTimeout(p.offT);
+  p.offT=setTimeout(()=>{if(H&&p.off&&!p.left){p.left=true;hostBroadcast({t:"left",name:p.name})}},60000);
 }
-const pubPlayers=()=>H.players.filter(p=>!p.left).map(p=>({id:p.id,name:p.name,color:p.color,score:p.score,ok:p.ok}));
-function hostBroadcastLobby(){hostBroadcast({t:"lobby",players:pubPlayers(),settings:H.settings,code:H.code,max:MAX_PLAYERS})}
+const pubPlayers=()=>H.players.filter(p=>!p.left).map(p=>({id:p.id,name:p.name,color:p.color,score:p.score,ok:p.ok,off:!!p.off}));
+const lobbyMsg=()=>({t:"lobby",players:pubPlayers(),settings:H.settings,code:H.code,max:MAX_PLAYERS});
+function hostBroadcastLobby(){hostBroadcast(lobbyMsg())}
+function hostState(){
+  const s={t:"state",phase:H.phase};
+  if(H.phase==="lobby")s.lobby=lobbyMsg();
+  else if(H.phase==="start")s.start={settings:H.settings,total:H.q.length};
+  else if(H.phase==="q"){s.q=H.curQ;s.elapsed=Date.now()-H.qStart;s.ans=[...H.answers.keys()];s.n=H.answers.size;s.of=activePlayers().length}
+  else if(H.phase==="reveal")s.r=H.lastR;
+  else if(H.phase==="end")s.end=H.lastEnd;
+  return s;
+}
+function hostBeat(){if(!H)return;const s=hostState();H.conns.forEach(c=>hostSend(c,s))}
 function hostStart(){
   const s=H.settings;
   const pool=DATA.filter(d=>s.region==="all"||d.reg===s.region);
-  // без повторов, пока хватает стран
   let q=[];while(q.length<s.n)q=q.concat(shuffle(pool));q=q.slice(0,s.n);
-  H.q=q.map(d=>{
-    const item={iso:d.iso};
-    if(s.mode!=="type")item.opts=pickOptions(d,pool).map(o=>o.iso);
-    return item;
-  });
+  H.q=q.map(d=>{const item={iso:d.iso};if(s.mode!=="type")item.opts=pickOptions(d,pool).map(o=>o.iso);return item});
+  H.players=H.players.filter(p=>!p.left);
   H.players.forEach(p=>{p.score=0;p.ok=0;p.streak=0});
-  H.qi=-1;hostBroadcast({t:"start",settings:s,total:s.n});
-  setTimeout(hostNext,1800);
+  H.qi=-1;H.phase="start";H.curQ=null;H.lastR=null;H.lastEnd=null;
+  hostBroadcast({t:"start",settings:s,total:s.n});
+  clearTimeout(H.auto);H.auto=setTimeout(hostNext,2200);
 }
 function hostNext(){
-  clearTimeout(H.auto);H.qi++;
+  if(!H)return;clearTimeout(H.auto);clearTimeout(H.timer);H.qi++;
   if(H.qi>=H.q.length){hostEnd();return}
   H.phase="q";H.answers=new Map();H.qStart=Date.now();
   const s=H.settings,it=H.q[H.qi],d=BY[it.iso],rev=s.mode==="rev";
-  const msg={t:"q",qi:H.qi,total:H.q.length,mode:s.mode,limit:s.time,
+  H.curQ={t:"q",qi:H.qi,total:H.q.length,mode:s.mode,limit:s.time,
     prompt:rev?d.capital:d.country,flag:rev?null:d.iso,
     opts:it.opts?it.opts.map(i=>rev?BY[i].country:BY[i].capital):null};
-  hostBroadcast(msg);
-  clearTimeout(H.timer);H.timer=setTimeout(hostReveal,s.time*1000+900);
+  hostBroadcast(H.curQ);
+  H.timer=setTimeout(hostReveal,s.time*1000+1200);
 }
 function hostAnswer(id,m){
   if(!H||H.phase!=="q"||m.qi!==H.qi||H.answers.has(id))return;
-  const p=H.players.find(p=>p.id===id);if(!p||p.left)return;
+  const p=H.players.find(x=>x.id===id);if(!p||p.left)return;
   const limit=H.settings.time*1000;
   let ms=Number(m.ms);if(!isFinite(ms))ms=limit;
   ms=Math.max(0,Math.min(limit,ms,Date.now()-H.qStart));
   H.answers.set(id,{v:String(m.v??"").slice(0,60),ms});
-  hostBroadcast({t:"prog",n:H.answers.size,of:H.players.filter(p=>!p.left).length});
+  hostBroadcast({t:"prog",qi:H.qi,n:H.answers.size,of:activePlayers().length});
   hostMaybeReveal();
 }
-function hostMaybeReveal(){if(H.phase==="q"&&H.answers.size>=H.players.filter(p=>!p.left).length)setTimeout(()=>{if(H&&H.phase==="q")hostReveal()},500)}
+function hostMaybeReveal(){
+  if(!H||H.phase!=="q")return;
+  if(activePlayers().every(p=>H.answers.has(p.id))){const qi=H.qi;setTimeout(()=>{if(H&&H.phase==="q"&&H.qi===qi)hostReveal()},600)}
+}
 function hostReveal(){
   if(!H||H.phase!=="q")return;clearTimeout(H.timer);H.phase="reveal";
   const s=H.settings,it=H.q[H.qi],d=BY[it.iso],rev=s.mode==="rev",limit=s.time*1000;
@@ -1169,31 +1221,36 @@ function hostReveal(){
   const right=results.filter(r=>r.ok).sort((a,b)=>a.ms-b.ms);
   right.forEach((r,i)=>{
     const p=H.players.find(x=>x.id===r.id);p.streak=(p.streak||0)+1;
-    r.pts=Math.round(1000*(1-(r.ms/limit)/2)) + (i===0&&right.length>1?100:0) + Math.min(3,p.streak-1)*50;
-    r.first=i===0;r.streak=p.streak;p.score+=r.pts;p.ok++;
+    r.pts=Math.round(1000*(1-(r.ms/limit)/2))+(i===0&&right.length>1?100:0)+Math.min(3,p.streak-1)*50;
+    r.first=i===0;p.score+=r.pts;p.ok++;
   });
   results.filter(r=>!r.ok).forEach(r=>{const p=H.players.find(x=>x.id===r.id);p.streak=0});
   results.sort((a,b)=>b.pts-a.pts);
-  hostBroadcast({t:"r",qi:H.qi,total:H.q.length,correct:correctText,country:d.country,capital:d.capital,iso:d.iso,hint:hintRaw(d),
-    results,board:pubPlayers().sort((a,b)=>b.score-a.score)});
+  H.lastR={t:"r",qi:H.qi,total:H.q.length,correct:correctText,country:d.country,capital:d.capital,iso:d.iso,hint:hintRaw(d),
+    results,board:pubPlayers().sort((a,b)=>b.score-a.score)};
+  hostBroadcast(H.lastR);
   H.auto=setTimeout(()=>{if(H&&H.phase==="reveal")hostNext()},9000);
 }
 function hostEnd(){
   H.phase="end";clearTimeout(H.timer);clearTimeout(H.auto);
-  hostBroadcast({t:"end",board:pubPlayers().sort((a,b)=>b.score-a.score),settings:H.settings,total:H.q.length});
+  H.lastEnd={t:"end",board:pubPlayers().sort((a,b)=>b.score-a.score),settings:H.settings,total:H.q.length};
+  hostBroadcast(H.lastEnd);
 }
 function hostAgain(){
   H.phase="lobby";H.players=H.players.filter(p=>!p.left);H.players.forEach(p=>{p.score=0;p.ok=0;p.streak=0});
-  hostBroadcastLobby();
+  H.curQ=null;H.lastR=null;H.lastEnd=null;hostBroadcastLobby();
 }
 function hostClose(){
-  if(!H)return;clearTimeout(H.timer);clearTimeout(H.auto);
-  H.conns.forEach(c=>hostSend(c,{t:"closed"}));
-  const peer=H.peer;H=null;setTimeout(()=>{try{peer.destroy()}catch(e){}},400);
+  if(!H)return;const h=H;H=null;
+  clearTimeout(h.timer);clearTimeout(h.auto);clearInterval(h.beat);
+  h.conns.forEach(c=>hostSend(c,{t:"closed"}));
+  keepAwake(false);
+  setTimeout(()=>{try{h.peer.destroy()}catch(e){}},500);
 }
 
 /* ---- guest ---- */
-let G=null; // {peer,conn}
+function battleKey(code){const all=load("cap.bkeys",{});if(!all[code]){all[code]=Math.random().toString(36).slice(2,12)+Date.now().toString(36).slice(-4);
+  const ks=Object.keys(all);if(ks.length>20)delete all[ks[0]];save("cap.bkeys",all)}return all[code]}
 function renderJoin(code,err){
   $("bsetCol").innerHTML=`
     <div class="titlebar"><button class="iconbtn" id="jBack" aria-label="На главную">${ICON.back}</button><h2>Тебя зовут в батл</h2></div>
@@ -1207,39 +1264,83 @@ function renderJoin(code,err){
     <div class="playbar"><button class="btn blue" id="jGo" data-code="${esc(code)}">Войти в батл</button></div>`;
   show("bset");
 }
-$("bset").addEventListener("click",e=>{
-  const b=e.target.closest("button");if(!b)return;
-  if(b.id==="jGo")guestJoin(b.dataset.code);
-  if(b.id==="jBack"){guestLeave();renderHome();show("home")}
-});
 function guestJoin(code){
   const nm=$("jName");S.name=(nm?nm.value:S.name).trim().slice(0,16);saveS();
   if(!S.name){renderJoin(code,"Напиши имя — его увидят остальные.");return}
   if(!peerReady()){renderJoin(code,"Не загрузился модуль для батла. Проверь интернет и обнови страницу.");return}
   const btn=$("jGo");if(btn){btn.disabled=true;btn.textContent="Подключаюсь…"}
-  guestLeave(true);
-  const peer=new Peer({debug:0});G={peer,conn:null,code,ok:false};
-  const fail=msg=>{if(!G||G.peer!==peer)return;try{peer.destroy()}catch(e){}G=null;renderJoin(code,msg)};
-  const to=setTimeout(()=>{if(G&&!G.ok)fail("Не получилось подключиться. Проверь код и что хост не закрыл комнату.")},15000);
-  peer.on("open",()=>{
-    const conn=peer.connect(PEER_PREFIX+code,{reliable:true});G.conn=conn;
-    conn.on("open",()=>{conn.send({t:"join",name:S.name})});
-    conn.on("data",m=>{if(m&&m.t==="deny"){clearTimeout(to);fail(m.reason||"Не пустили в батл.");return}if(m&&m.t==="hello"){G.ok=true;clearTimeout(to);C={host:false,me:m.you,players:[],code}}clientOn(m)});
-    conn.on("close",()=>{if(G&&G.conn===conn&&G.ok){G=null;showClosed("Связь с хостом пропала.")}});
-  });
-  peer.on("error",err=>{clearTimeout(to);
-    if(err.type==="peer-unavailable")fail("Комната не найдена. Возможно, хост её уже закрыл.");
-    else if(!G||!G.ok)fail("Ошибка подключения ("+(err.type||"сеть")+"). Попробуй ещё раз.");
+  guestLeave();
+  G={code,key:battleKey(code),peer:null,conn:null,ok:false,last:0,tries:0,watch:null,retryT:null};
+  G.failT=setTimeout(()=>{if(G&&!G.ok)guestFail("Не получилось подключиться. Проверь код, что хост не закрыл комнату, и попробуй другую сеть (Wi-Fi ↔ мобильный интернет).")},20000);
+  guestOpenPeer();
+}
+function guestFail(msg){const code=G?G.code:"";guestLeave();renderJoin(code,msg)}
+function guestOpenPeer(){
+  const g=G;if(!g)return;
+  if(g.peer){try{g.peer.destroy()}catch(e){}}
+  const peer=new Peer(PEER_OPTS);g.peer=peer;
+  peer.on("open",()=>{if(G===g&&g.peer===peer)guestConnect()});
+  peer.on("disconnected",()=>{if(G===g&&g.peer===peer&&!peer.destroyed)setTimeout(()=>{try{if(!peer.destroyed&&peer.disconnected)peer.reconnect()}catch(e){}},1000)});
+  peer.on("error",err=>{
+    if(G!==g||g.peer!==peer)return;
+    if(err.type==="peer-unavailable"&&!g.ok){guestFail("Комната не найдена. Возможно, хост её уже закрыл.");return}
+    if(["browser-incompatible","ssl-unavailable"].includes(err.type)){guestFail("Этот браузер не поддерживает батл. Открой ссылку в Safari или Chrome.");return}
+    guestRetrySoon(err.type==="network"||err.type==="server-error"||err.type==="socket-error"||err.type==="socket-closed");
   });
 }
-function guestLeave(silent){if(G){try{G.conn&&G.conn.close()}catch(e){}try{G.peer.destroy()}catch(e){}G=null}}
+function guestConnect(){
+  const g=G;if(!g||!g.peer||g.peer.destroyed)return;
+  if(g.peer.disconnected||!g.peer.open){guestRetrySoon(true);return}
+  const prev=g.conn;
+  const conn=g.peer.connect(PEER_PREFIX+g.code,CONN_OPTS);g.conn=conn;
+  if(prev){try{prev.close()}catch(e){}}
+  const openT=setTimeout(()=>{if(G===g&&g.conn===conn&&!conn.open)guestRetrySoon(false)},8000);
+  conn.on("open",()=>{if(G!==g||g.conn!==conn)return;clearTimeout(openT);g.last=Date.now();try{conn.send({t:"join",name:S.name,key:g.key})}catch(e){}});
+  conn.on("data",m=>{if(G!==g||g.conn!==conn)return;g.last=Date.now();guestOnData(m)});
+  conn.on("close",()=>{if(G===g&&g.conn===conn)guestRetrySoon(false)});
+  conn.on("error",()=>{if(G===g&&g.conn===conn)guestRetrySoon(false)});
+}
+function guestRetrySoon(newPeer){
+  const g=G;if(!g||g.retryT)return;
+  g.tries++;
+  if(g.ok){toastOnce("Связь пропала — переподключаюсь…");if(g.tries>25){guestLeave();showClosed("Не получается связаться с хостом. Проверь интернет и зайди по ссылке ещё раз.");return}}
+  g.retryT=setTimeout(()=>{g.retryT=null;if(G!==g)return;
+    if(newPeer||!g.peer||g.peer.destroyed||g.tries%4===0)guestOpenPeer();else guestConnect();
+  },Math.min(700*g.tries,4000));
+}
+function guestOnData(m){
+  if(!G||!m||typeof m!=="object")return;
+  if(m.t==="deny"){guestFail(m.reason||"Не пустили в батл.");return}
+  if(m.t==="hello"){
+    const again=G.ok;G.ok=true;G.tries=0;clearTimeout(G.failT);
+    if(!C||C.host)C={host:false,me:m.you,players:[],code:G.code};else C.me=m.you;
+    if(again)toastOnce("Снова на связи");
+    keepAwake(true);startWatch();
+    try{G.conn.send({t:"sync"})}catch(e){}
+    return;
+  }
+  if(m.t==="closed"){guestLeave();showClosed("Хост закрыл комнату.");return}
+  clientOn(m);
+}
+function startWatch(){const g=G;clearInterval(g.watch);g.watch=setInterval(()=>{if(G!==g){clearInterval(g.watch);return}guestCheck(false)},2000)}
+function guestCheck(force){
+  const g=G;if(!g||!g.ok)return;
+  const quiet=Date.now()-g.last;
+  if(quiet>7000||(force&&quiet>3000))guestRetrySoon(false);
+  else if(force&&g.conn&&g.conn.open){try{g.conn.send({t:"sync"})}catch(e){}}
+}
+function guestLeave(){
+  if(G){const g=G;G=null;clearTimeout(g.failT);clearTimeout(g.retryT);clearInterval(g.watch);
+    try{g.conn&&g.conn.close()}catch(e){}try{g.peer&&g.peer.destroy()}catch(e){}}
+  if(!H)keepAwake(false);
+}
 function sendAnswer(v){
   if(!C||!C.q||C.answered)return;C.answered=true;
-  const msg={t:"a",qi:C.q.qi,v,ms:Date.now()-C.qAt};
+  const msg={t:"a",qi:C.q.qi,v,ms:Date.now()-C.qAt};C.pendingA=msg;
   if(C.host)hostAnswer("host",msg);else{try{G.conn.send(msg)}catch(e){}}
 }
 function showClosed(reason){
-  clearInterval(C&&C.tick);C=null;
+  if(C)clearInterval(C.tick);C=null;
   $("bendCol").innerHTML=`<div class="res-hero" style="padding-top:40px"><div class="bigmark"><span><b>✉</b><small>БАТЛ ЗАКРЫТ</small></span></div><h2>Батл закончился</h2><p>${esc(reason)}</p></div>
     <div class="res-actions"><button class="btn red" id="bToHome">На главную</button></div>`;
   closeSheet();show("bend");
@@ -1249,15 +1350,29 @@ function showClosed(reason){
 function clientOn(m){
   if(!m||typeof m!=="object"||!C)return;
   switch(m.t){
-    case "lobby": C.players=m.players||[];C.settings=m.settings;C.code=m.code;C.phase="lobby";closeSheet();renderLobby();if($("blobby").hidden)show("blobby");break;
-        case "start": C.phase="start";C.settings=m.settings;C.myScore=0;C.myOk=0;renderCountdown();break;
-    case "q": renderBQ(m);break;
-    case "prog": if(C.answered){const w=$("bwait");if(w)w.textContent=`Ответ принят. Ответили ${m.n} из ${m.of}…`}break;
+    case "lobby": C.players=m.players||[];C.settings=m.settings;C.code=m.code;C.phase="lobby";C.lobbySig=JSON.stringify(m.players);closeSheet();renderLobby();if($("blobby").hidden)show("blobby");break;
+    case "start": C.phase="start";C.settings=m.settings;C.q=null;C.lastReveal=null;C.endSaved=false;renderCountdown();break;
+    case "q": renderBQ(m,0);break;
+    case "prog": if(C.answered&&C.q&&m.qi===C.q.qi){const w=$("bwait");if(w)w.textContent=`Ответ принят. Ответили ${m.n} из ${m.of}…`}break;
     case "r": renderReveal(m);break;
     case "left": toast(`${m.name} вышел из батла`);break;
     case "end": renderBEnd(m);break;
-    case "closed": guestLeave();showClosed("Хост закрыл комнату.");break;
+    case "state": applyState(m);break;
   }
+}
+// догоняем хоста, если какое-то сообщение потерялось
+function applyState(s){
+  if(!C||C.host)return;
+  if(s.phase==="lobby"&&s.lobby){if(C.phase!=="lobby"||C.lobbySig!==JSON.stringify(s.lobby.players))clientOn(s.lobby);return}
+  if(s.phase==="start"&&s.start){if(C.phase!=="start")clientOn({t:"start",settings:s.start.settings,total:s.start.total});return}
+  if(s.phase==="q"&&s.q){
+    if(C.phase!=="q"||!C.q||C.q.qi!==s.q.qi){renderBQ(s.q,s.elapsed||0);return}
+    if(C.answered&&C.pendingA&&C.pendingA.qi===s.q.qi&&!(s.ans||[]).includes(C.me)){try{G.conn.send(C.pendingA)}catch(e){}}
+    else if(C.answered){const w=$("bwait");if(w&&s.of)w.textContent=`Ответ принят. Ответили ${s.n} из ${s.of}…`}
+    return;
+  }
+  if(s.phase==="reveal"&&s.r){if(C.phase!=="reveal"||!C.lastReveal||C.lastReveal.qi!==s.r.qi)renderReveal(s.r);return}
+  if(s.phase==="end"&&s.end){if(C.phase!=="end")renderBEnd(s.end)}
 }
 function lobbySummary(s){return `${MODENAME[s.mode]} · ${REGNAME[s.region]} · ${s.n} ${plural(s.n,"вопрос","вопроса","вопросов")} · ${s.time} с`}
 function renderLobby(){
@@ -1276,7 +1391,7 @@ function renderLobby(){
       ${Array.from({length:slots},()=>`<div class="pl slot">свободное место</div>`).join("")}</div>
     </div>
     <div class="box"><span class="lbl">Правила</span><span style="font-weight:600">${esc(lobbySummary(s))}</span>
-      <span class="muted" style="font-size:.88rem">Правильный ответ даёт от 500 до 1000 очков: чем быстрее, тем больше. Самый быстрый правильный получает ещё +100, серия правильных ответов даёт бонус.</span></div>
+      <span class="muted" style="font-size:.88rem">Правильный ответ даёт от 500 до 1000 очков: чем быстрее, тем больше. Самый быстрый правильный получает ещё +100, серия правильных ответов даёт бонус. Держите экран включённым во время игры.</span></div>
     ${C.host?`<div class="playbar"><button class="btn red" id="lStart" ${ps.length<2?"disabled":""}>${ps.length<2?"Ждём хотя бы одного друга":"Начать батл"}</button></div>`:""}`;
 }
 $("blobby").addEventListener("click",e=>{
@@ -1289,44 +1404,47 @@ $("blobby").addEventListener("click",e=>{
 function askLeaveBattle(){
   $("sheet").className="sheet on neutral";
   $("sheetIn").innerHTML=`<div class="sh-title"><span class="badge">${ICON.x}</span>${C&&C.host?"Закрыть комнату?":"Выйти из батла?"}</div>
-    <div class="sh-ans">${C&&C.host?"Батл закончится для всех игроков.":"Вернуться в этот батл можно будет по ссылке, пока идёт лобби."}</div>
+    <div class="sh-ans">${C&&C.host?"Батл закончится для всех игроков.":"Пока батл идёт, можно вернуться по той же ссылке — очки сохранятся."}</div>
     <div class="row"><button class="btn ghost" id="bStay">Остаться</button><button class="btn red" id="bLeave">${C&&C.host?"Закрыть":"Выйти"}</button></div>`;
 }
 $("sheet").addEventListener("click",e=>{
   const t=e.target.closest("button");if(!t)return;
   if(t.id==="bStay"){if(C&&C.phase==="reveal"&&C.lastReveal)renderRevealSheet(C.lastReveal);else closeSheet()}
-  else if(t.id==="bLeave"){closeSheet();if(C&&C.host)hostClose();else guestLeave();clearInterval(C&&C.tick);C=null;renderHome();show("home")}
+  else if(t.id==="bLeave"){closeSheet();if(C&&C.host)hostClose();else guestLeave();if(C)clearInterval(C.tick);C=null;renderHome();show("home")}
   else if(t.id==="bNextQ"&&H&&H.phase==="reveal"){sfx.tap();closeSheet();hostNext()}
 });
 $("bquit").addEventListener("click",askLeaveBattle);
 
 function renderCountdown(){
-  show("bplay");$("bnum").textContent="";$("btrack").style.width="100%";
+  clearInterval(C.tick);closeSheet();
+  show("bplay");$("bnum").textContent="";$("btrack").style.width="100%";$("btrackWrap").classList.remove("low");
   $("bstage").innerHTML=`<div class="res-hero"><div class="bigmark great"><span><b id="cd">3</b><small>ПРИГОТОВЬСЯ</small></span></div><h2>${esc(lobbySummary(C.settings))}</h2></div>`;
   $("bdock").innerHTML="";
-  let n=3;sfx.tick();const iv=setInterval(()=>{n--;const el=$("cd");if(!el||n<=0){clearInterval(iv);return}el.textContent=n;sfx.tick()},600);
+  let n=3;sfx.tick();const iv=setInterval(()=>{n--;const el=$("cd");if(!el||n<=0){clearInterval(iv);return}el.textContent=n;sfx.tick()},650);
 }
-function renderBQ(m){
+function renderBQ(m,elapsed){
+  if(!m||typeof m.qi!=="number")return;
   closeSheet();if($("bplay").hidden)show("bplay");
-  C.q=m;C.qAt=Date.now();C.answered=false;C.phase="q";
+  C.q=m;C.qAt=Date.now()-Math.max(0,elapsed||0);C.answered=false;C.pendingA=null;C.phase="q";
   const rev=m.mode==="rev";
   $("bnum").textContent=`${m.qi+1}/${m.total}`;
   $("bstage").innerHTML=`<div class="post in"><div class="card"><div class="top"><div style="min-width:0"><div class="ask">${rev?"Чья это столица?":"Столица страны"}</div><div class="name">${esc(m.prompt)}</div></div>
     <div class="stamp${m.flag?"":" q"}" aria-hidden="true">${m.flag&&/^[A-Z]{2}$/.test(m.flag)?flag(m.flag):"?"}</div></div></div></div>`;
-  if(m.opts){
+  if(Array.isArray(m.opts)){
     $("bdock").innerHTML=`<div class="opts">${m.opts.map((o,i)=>`<button class="opt" data-i="${i}">${esc(o)}</button>`).join("")}</div>`;
   }else{
     $("bdock").innerHTML=`<form id="bForm" style="display:flex;flex-direction:column;gap:10px"><input class="type" id="bIn" type="text" autocomplete="off" autocapitalize="sentences" autocorrect="off" spellcheck="false" enterkeyhint="send" placeholder="Напиши столицу…" aria-label="Столица"><button type="submit" class="btn main">Ответить</button></form>`;
     setTimeout(()=>{const i=$("bIn");i&&i.focus({preventScroll:true})},200);
   }
-  // таймер
-  clearInterval(C.tick);const wrap=$("btrackWrap"),bar=$("btrack"),lim=m.limit*1000;let lastSec=99;
-  C.tick=setInterval(()=>{const left=Math.max(0,lim-(Date.now()-C.qAt));bar.style.width=(left/lim*100)+"%";wrap.classList.toggle("low",left<4000);
+  clearInterval(C.tick);const wrap=$("btrackWrap"),bar=$("btrack"),lim=(+m.limit||15)*1000;let lastSec=99;
+  const step=()=>{if(!C||C.phase!=="q"||C.q!==m){clearInterval(C&&C.tick);return}
+    const left=Math.max(0,lim-(Date.now()-C.qAt));bar.style.width=(left/lim*100)+"%";wrap.classList.toggle("low",left<4000);
     const sec=Math.ceil(left/1000);if(sec<=3&&sec!==lastSec&&sec>0&&!C.answered)sfx.tick();lastSec=sec;
-    if(left<=0){clearInterval(C.tick);if(!C.answered){C.answered=true;lockBDock();bWait("Время вышло…")}}},100);
+    if(left<=0){clearInterval(C.tick);if(!C.answered){C.answered=true;lockBDock();bWait("Время вышло… ждём результаты")}}};
+  step();C.tick=setInterval(step,100);
 }
 function lockBDock(){document.querySelectorAll("#bdock .opt,#bdock button,#bdock input").forEach(x=>{x.disabled=true})}
-function bWait(text){const d=document.createElement("div");d.className="wait";d.id="bwait";d.textContent=text;$("bdock").appendChild(d)}
+function bWait(text){const old=$("bwait");if(old)old.remove();const d=document.createElement("div");d.className="wait";d.id="bwait";d.textContent=text;$("bdock").appendChild(d)}
 $("bdock").addEventListener("click",e=>{
   const b=e.target.closest(".opt");if(!b||!C||C.answered||!C.q||!C.q.opts)return;
   b.classList.add("picked");sendAnswer(C.q.opts[+b.dataset.i]);lockBDock();
@@ -1338,35 +1456,43 @@ $("bdock").addEventListener("submit",e=>{
   sendAnswer(v);lockBDock();$("bIn").blur();sfx.tap();bWait("Ответ принят. Ждём остальных…");
 });
 function renderReveal(m){
-  clearInterval(C.tick);C.phase="reveal";C.lastReveal=m;
-  const mine=m.results.find(r=>r.id===C.me);
-  const ok=mine&&mine.ok;
+  if(!m||typeof m.qi!=="number"||!Array.isArray(m.results))return;
+  if(C.tick)clearInterval(C.tick);
+  // если вопрос до нас не дошёл — показываем хотя бы, о какой стране был вопрос
+  if(!C.q||C.q.qi!==m.qi){
+    if($("bplay").hidden)show("bplay");
+    $("bnum").textContent=`${m.qi+1}/${m.total}`;$("btrack").style.width="0";
+    $("bstage").innerHTML=`<div class="post"><div class="card"><div class="top"><div style="min-width:0"><div class="ask">Столица страны</div><div class="name">${esc(m.country)}</div></div><div class="stamp">${BY[m.iso]?flag(m.iso):"?"}</div></div></div></div>`;
+    $("bdock").innerHTML="";C.q=null;
+  }
+  C.phase="reveal";C.lastReveal=m;
+  const mine=m.results.find(r=>r.id===C.me),ok=!!(mine&&mine.ok);
   if(mine){if(ok){sfx.ok();buzz(15)}else{sfx.bad();buzz([30,40,30])}}
-  // подсветка вариантов
   if(C.q&&C.q.opts)document.querySelectorAll("#bdock .opt").forEach(b=>{const v=C.q.opts[+b.dataset.i];
-    b.classList.remove("dim");if(v===m.correct)b.classList.add("ok");else if(b.classList.contains("picked"))b.classList.add("bad");else b.classList.add("dim")});
+    b.disabled=true;b.classList.remove("dim");if(v===m.correct)b.classList.add("ok");else if(b.classList.contains("picked"))b.classList.add("bad");else b.classList.add("dim")});
   const inp=$("bIn");if(inp)inp.classList.add(ok?"ok":"bad");
   const w=$("bwait");if(w)w.remove();
-  // запомнить для статистики
   const d=BY[m.iso];
-  if(d){seen[d.iso]=1;save("cap.seen",seen);if(ok){countDay()}}
-  setTimeout(()=>renderRevealSheet(m),450);
+  if(d&&C.countedQi!==m.qi+"/"+m.total){C.countedQi=m.qi+"/"+m.total;seen[d.iso]=1;save("cap.seen",seen);if(ok)countDay()}
+  const qi=m.qi;setTimeout(()=>{if(C&&C.phase==="reveal"&&C.lastReveal&&C.lastReveal.qi===qi)renderRevealSheet(m)},450);
 }
 function renderRevealSheet(m){
-  const mine=m.results.find(r=>r.id===C.me),ok=mine&&mine.ok,d=BY[m.iso];
+  const mine=m.results.find(r=>r.id===C.me),ok=!!(mine&&mine.ok),d=BY[m.iso];
   const place=m.board.findIndex(p=>p.id===C.me)+1;
-  const title=!mine?"Ответ":ok?(mine.first&&m.results.filter(r=>r.ok).length>1?"Быстрее всех!":"Верно!"):(mine.v?"Мимо":"Не успела");
+  const several=m.results.filter(r=>r.ok).length>1;
+  const title=!mine?"Ответ":ok?(mine.first&&several?"Быстрее всех!":"Верно!"):(mine.v?"Мимо":"Не успела");
   $("sheet").className="sheet on "+(ok?"ok":"bad");
   $("sheetIn").innerHTML=`<div class="sh-title"><span class="badge">${ok?ICON.check:ICON.x}</span>${esc(title)}${ok?`<span style="margin-left:auto;font-size:1rem">+${mine.pts}</span>`:""}</div>
     <div class="sh-ans">${esc(m.country)} — <b>${esc(m.capital)}</b>${place?` · ты на ${place} месте`:""}</div>
-    <div class="memo"><div class="mlbl"><span>Запомни так</span></div><div class="txt">${d?hintText(d):fmt(m.hint)}</div></div>
-    <div class="players">${m.board.map((p,i)=>{const r=m.results.find(x=>x.id===p.id)||{};return `<div class="pl${p.id===C.me?" me":""}" style="background:var(--card)">${avatar(p,i)}<span class="pn">${esc(p.name)} ${r.first&&r.ok&&m.results.filter(x=>x.ok).length>1?'<span class="tag">первый</span>':""}</span><span class="delta${r.ok?"":" no"}">${r.ok?"+"+r.pts:(r.v?"мимо":"—")}</span><span class="ps">${p.score}</span></div>`}).join("")}</div>
+    <div class="memo"><div class="mlbl"><span>Запомни так</span></div><div class="txt">${d?hintText(d):fmt(m.hint||"")}</div></div>
+    <div class="players">${m.board.map((p,i)=>{const r=m.results.find(x=>x.id===p.id)||{};return `<div class="pl${p.id===C.me?" me":""}" style="background:var(--card)">${avatar(p,i)}<span class="pn">${esc(p.name)} ${r.first&&r.ok&&several?'<span class="tag">первый</span>':""}${p.off?'<span class="pt"> · нет связи</span>':""}</span><span class="delta${r.ok?"":" no"}">${r.ok?"+"+r.pts:(r.v?"мимо":"—")}</span><span class="ps">${p.score}</span></div>`}).join("")}</div>
     ${C.host?`<button class="btn ${ok?"good":"red"}" id="bNextQ">${m.qi+1>=m.total?"Итоги батла":"Следующий вопрос"}</button>`:`<div class="wait">Следующий вопрос сейчас появится…</div>`}`;
 }
 function renderBEnd(m){
-  clearInterval(C.tick);C.phase="end";closeSheet();
+  if(!m||!Array.isArray(m.board))return;
+  if(C.tick)clearInterval(C.tick);C.phase="end";closeSheet();
   const b=m.board,myPlace=b.findIndex(p=>p.id===C.me)+1,me=b.find(p=>p.id===C.me);
-  if(me)addHist({kind:"battle",mode:m.settings.mode,region:m.settings.region,n:m.total,place:myPlace,players:b.length,score:me.score,ok:me.ok});
+  if(me&&!C.endSaved){C.endSaved=true;addHist({kind:"battle",mode:m.settings.mode,region:m.settings.region,n:m.total,place:myPlace,players:b.length,score:me.score,ok:me.ok})}
   if(myPlace===1)sfx.win();
   const pod=[b[1],b[0],b[2]].map((p,i)=>p?`<div class="pod p${[2,1,3][i]}">${avatar(p,b.indexOf(p))}<span class="pn">${esc(p.name)}</span><span class="ps">${p.score}</span><div class="col-b">${[2,1,3][i]}</div></div>`:`<div></div>`).join("");
   $("bendCol").innerHTML=`
@@ -1382,7 +1508,7 @@ $("bend").addEventListener("click",e=>{
   if(b.id==="bAgain"&&H){sfx.tap();hostAgain()}
   else if(b.id==="bToHome"){if(H)hostClose();guestLeave();if(C)clearInterval(C.tick);C=null;renderHome();show("home")}
 });
-window.addEventListener("beforeunload",()=>{if(H)hostClose();guestLeave()});
+window.addEventListener("pagehide",e=>{if(!e.persisted){if(H)hostClose();guestLeave()}});
 
 /* ======================================================================
    ASSOCIATIONS: manager, share, import
